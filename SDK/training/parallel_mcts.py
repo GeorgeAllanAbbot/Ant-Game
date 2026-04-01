@@ -6,7 +6,8 @@ from typing import List, Optional, Tuple, Dict, Any
 
 from SDK.backend.state import BackendState
 from SDK.utils.actions import ActionBundle, ActionCatalog
-from SDK.training.state_encoder import StateEncoder
+from SDK.utils.features import FeatureExtractor
+from SDK.training.action_encoder import ActionEncoder
 from SDK.utils.constants import MAX_ACTIONS
 
 @dataclass
@@ -46,7 +47,8 @@ class ParallelMCTS:
     def __init__(self, config: SearchConfig):
         self.config = config
         self.action_catalog = ActionCatalog(max_actions=MAX_ACTIONS)
-        self.encoder = StateEncoder()
+        self.feature_extractor = FeatureExtractor(max_actions=MAX_ACTIONS)
+        self.action_encoder = ActionEncoder(max_actions=MAX_ACTIONS)
         self.rng = random.Random(config.seed)
 
     def get_action_mask(self, bundles: List[ActionBundle]) -> np.ndarray:
@@ -65,25 +67,28 @@ class ParallelMCTS:
         explore = self.config.c_puct * child.prior * math.sqrt(parent.visits + 1.0) / (child.visits + 1.0)
         return child.mean_value + explore
 
-    def expand_and_evaluate_request(self, node: MCTSNode) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    def expand_and_evaluate_request(self, node: MCTSNode) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
         """
-        Returns (encoded_state, action_features, action_mask, heuristic_value) for NN batch.
+        Returns (board, stats, action_features, action_mask, heuristic_value) for NN batch.
         """
         terminal = self._terminal_value(node.state, node.player)
         if terminal is not None:
             node.expanded = True
-            return None, None, None, terminal
+            return None, None, None, None, terminal
 
         node.bundles = self.action_catalog.build(node.state, node.player)
         if not node.bundles or node.depth >= self.config.max_depth:
             node.expanded = True
-            return None, None, None, 0.0
+            return None, None, None, None, 0.0
 
-        encoded = self.encoder.encode(node.state, node.player)
-        action_features = self.encoder.encode_action(node.bundles, node.player)
         mask = self.get_action_mask(node.bundles)
+        obs = self.feature_extractor.encode_observation(node.state, node.player, mask)
 
-        return encoded, action_features, mask, None
+        board = obs['board']
+        stats = obs['stats']
+        action_features = self.action_encoder.encode_action(node.bundles, node.player)
+
+        return board, stats, action_features, mask, None
 
     def apply_nn_evaluation(self, node: MCTSNode, policy: np.ndarray, value: float, is_root: bool = False) -> float:
         node.expanded = True
@@ -181,22 +186,23 @@ class ParallelMCTS:
         return action, probs
 
 class ReplayBuffer:
-    def __init__(self, capacity: int = 10000):
+    def __init__(self, capacity: int = 100000):
         self.capacity = capacity
         self.buffer = []
         self.position = 0
 
-    def push(self, state: np.ndarray, action_feat: np.ndarray, mask: np.ndarray, policy: np.ndarray, value: float):
+    def push(self, board: np.ndarray, stats: np.ndarray, action_feat: np.ndarray, mask: np.ndarray, policy: np.ndarray, value: float):
         if len(self.buffer) < self.capacity:
             self.buffer.append(None)
-        self.buffer[self.position] = (state, action_feat, mask, policy, value)
+        self.buffer[self.position] = (board, stats, action_feat, mask, policy, value)
         self.position = (self.position + 1) % self.capacity
 
-    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         batch = random.sample(self.buffer, batch_size)
-        states, action_feats, masks, policies, values = zip(*batch)
+        boards, stats_batch, action_feats, masks, policies, values = zip(*batch)
         return (
-            np.stack(states),
+            np.stack(boards),
+            np.stack(stats_batch),
             np.stack(action_feats),
             np.stack(masks),
             np.stack(policies),
