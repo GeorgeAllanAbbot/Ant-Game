@@ -35,6 +35,7 @@ def mcts_worker(worker_id, request_queue, response_queue):
             for _ in range(config.iterations):
                 paths = {}
                 batch_states = []
+                batch_action_features = []
                 batch_masks = []
                 batch_agents = []
 
@@ -47,10 +48,11 @@ def mcts_worker(worker_id, request_queue, response_queue):
 
                     if not leaf.expanded:
                         # Expand
-                        encoded, mask, heuristic = mcts.expand_and_evaluate_request(leaf)
+                        encoded, action_feat, mask, heuristic = mcts.expand_and_evaluate_request(leaf)
                         if heuristic is None:
                             # Needs NN evaluation
                             batch_states.append(encoded)
+                            batch_action_features.append(action_feat)
                             batch_masks.append(mask)
                             batch_agents.append(agent)
                         else:
@@ -60,8 +62,9 @@ def mcts_worker(worker_id, request_queue, response_queue):
                 # If we have nodes that need NN eval, send batch request
                 if batch_states:
                     state_np = np.stack(batch_states)
+                    action_feat_np = np.stack(batch_action_features)
                     mask_np = np.stack(batch_masks)
-                    request_queue.put(('eval', worker_id, state_np, mask_np))
+                    request_queue.put(('eval', worker_id, state_np, action_feat_np, mask_np))
 
                     # Wait for response
                     policies, values = response_queue.get()
@@ -83,8 +86,9 @@ def mcts_worker(worker_id, request_queue, response_queue):
                     actions[agent] = action
 
                     encoded_state = mcts.encoder.encode(env.state, root.player)
+                    action_feat = mcts.encoder.encode_action(root.bundles, root.player)
                     mask = mcts.get_action_mask(root.bundles)
-                    trajectory.append((encoded_state, mask, probs, root.player))
+                    trajectory.append((encoded_state, action_feat, mask, probs, root.player))
                 else:
                     actions[agent] = 0
 
@@ -92,11 +96,11 @@ def mcts_worker(worker_id, request_queue, response_queue):
 
         winner = env.state.winner
         final_data = []
-        for state, mask, probs, player in trajectory:
+        for state, action_feat, mask, probs, player in trajectory:
             val = 0.0
             if winner is not None:
                 val = 1.0 if winner == player else -1.0
-            final_data.append((state, mask, probs, val))
+            final_data.append((state, action_feat, mask, probs, val))
 
         request_queue.put(('trajectory', final_data))
 
@@ -140,12 +144,14 @@ def evaluator_worker(model_path, best_model_path, result_queue):
 
                 # Simple 1-step evaluation for fast eval
                 encoded = mcts.encoder.encode(env.state, i)
+                action_feat = mcts.encoder.encode_action(bundles, i)
                 mask = mcts.get_action_mask(bundles)
 
                 with torch.no_grad():
                     s = torch.tensor(encoded, dtype=torch.float32, device=device).unsqueeze(0)
+                    a = torch.tensor(action_feat, dtype=torch.float32, device=device).unsqueeze(0)
                     m = torch.tensor(mask, dtype=torch.float32, device=device).unsqueeze(0)
-                    policy, _ = model(s, m)
+                    policy, _ = model(s, a, m)
                     policy = policy[0].numpy()
 
                 action = int(np.argmax(policy[:len(bundles)]))
@@ -172,7 +178,7 @@ def train_pipeline():
     model.share_memory()
 
     # Save initial best model
-    model.save_checkpoint('checkpoints/best_model.pt')
+    os.system("cp checkpoints/latest_model.pt checkpoints/best_model.pt")
     model.save_checkpoint('checkpoints/latest_model.pt')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -191,7 +197,7 @@ def train_pipeline():
 
     eval_process = None
     step = 0
-    batch_states, batch_masks, batch_worker_ids = [], [], []
+    batch_states, batch_action_feats, batch_masks, batch_worker_ids = [], [], [], []
 
     # Throttle training to trajectory collection
     trajectories_collected = 0
@@ -208,11 +214,10 @@ def train_pipeline():
                         for data in msg[1]:
                             buffer.push(*data)
                     elif msg[0] == 'eval':
-                        _, worker_id, state_np, mask_np = msg
-                        # The worker sends a batch per environment. In this simple loop it's just 2 agents.
-                        # We accumulate across multiple workers if available instantly.
-                        for s, m in zip(state_np, mask_np):
+                        _, worker_id, state_np, action_feat_np, mask_np = msg
+                        for s, a, m in zip(state_np, action_feat_np, mask_np):
                             batch_states.append(s)
+                            batch_action_feats.append(a)
                             batch_masks.append(m)
                             batch_worker_ids.append(worker_id)
                 except Empty:
@@ -221,8 +226,9 @@ def train_pipeline():
             if batch_states:
                 with torch.no_grad():
                     s = torch.tensor(np.stack(batch_states), dtype=torch.float32, device=device)
+                    a = torch.tensor(np.stack(batch_action_feats), dtype=torch.float32, device=device)
                     m = torch.tensor(np.stack(batch_masks), dtype=torch.float32, device=device)
-                    policies, values = model(s, m)
+                    policies, values = model(s, a, m)
                     policies = policies.cpu().numpy()
                     values = values.cpu().numpy()
 
@@ -237,25 +243,26 @@ def train_pipeline():
                     response_queues[worker_id].put((np.stack(p_list), np.stack(v_list)))
 
                 batch_states.clear()
+                batch_action_feats.clear()
                 batch_masks.clear()
                 batch_worker_ids.clear()
 
             # Train if we have enough data and respect a sample/update ratio
             if len(buffer) >= 2048 and (trajectories_collected - last_trajectories_trained) > 0:
-                # To prevent overfitting on early data, we update proportionally to new trajectories
                 updates = trajectories_collected - last_trajectories_trained
                 last_trajectories_trained = trajectories_collected
 
                 for _ in range(updates):
-                    states, masks, policies, values = buffer.sample(256)
+                    states, action_feats, masks, policies, values = buffer.sample(256)
 
                     s = torch.tensor(states, dtype=torch.float32, device=device)
+                    a = torch.tensor(action_feats, dtype=torch.float32, device=device)
                     m = torch.tensor(masks, dtype=torch.float32, device=device)
                     p_target = torch.tensor(policies, dtype=torch.float32, device=device)
                     v_target = torch.tensor(values, dtype=torch.float32, device=device).unsqueeze(1)
 
                     optimizer.zero_grad()
-                    p_pred, v_pred = model(s, m)
+                    p_pred, v_pred = model(s, a, m)
 
                     v_loss = torch.nn.functional.mse_loss(v_pred, v_target)
                     p_loss = -(p_target * torch.log(p_pred + 1e-8)).sum(dim=1).mean()
@@ -279,13 +286,12 @@ def train_pipeline():
                             )
                             eval_process.start()
 
-            # Check for eval results
             if not eval_result_queue.empty():
                 win_rate = eval_result_queue.get()
                 print(f"Evaluation finished! Win rate: {win_rate * 100:.2f}%")
                 if win_rate > 0.55:
                     print("New best model! Updating checkpoints/best_model.pt")
-                    model.save_checkpoint('checkpoints/best_model.pt')
+                    os.system("cp checkpoints/latest_model.pt checkpoints/best_model.pt")
 
     except KeyboardInterrupt:
         print("Stopping training...")

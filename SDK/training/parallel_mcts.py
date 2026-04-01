@@ -42,7 +42,6 @@ class MCTSNode:
             return 0.0
         return self.value_sum / self.visits
 
-
 class ParallelMCTS:
     def __init__(self, config: SearchConfig):
         self.config = config
@@ -54,7 +53,6 @@ class ParallelMCTS:
         return self.action_catalog.action_mask(bundles).astype(np.float32)
 
     def select(self, node: MCTSNode) -> List[MCTSNode]:
-        """Traverse tree to find a leaf node"""
         path = [node]
         current = node
         while current.expanded and current.children and current.depth < self.config.max_depth and not current.state.terminal:
@@ -67,29 +65,27 @@ class ParallelMCTS:
         explore = self.config.c_puct * child.prior * math.sqrt(parent.visits + 1.0) / (child.visits + 1.0)
         return child.mean_value + explore
 
-    def expand_and_evaluate_request(self, node: MCTSNode) -> Tuple[np.ndarray, np.ndarray, float]:
+    def expand_and_evaluate_request(self, node: MCTSNode) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         """
-        Returns (encoded_state, action_mask, heuristic_value) for the NN batch.
-        If node is terminal, returns a value immediately without NN inference.
+        Returns (encoded_state, action_features, action_mask, heuristic_value) for NN batch.
         """
         terminal = self._terminal_value(node.state, node.player)
         if terminal is not None:
             node.expanded = True
-            return None, None, terminal
+            return None, None, None, terminal
 
         node.bundles = self.action_catalog.build(node.state, node.player)
         if not node.bundles or node.depth >= self.config.max_depth:
             node.expanded = True
-            # For simplicity, fallback heuristic or 0
-            return None, None, 0.0
+            return None, None, None, 0.0
 
         encoded = self.encoder.encode(node.state, node.player)
+        action_features = self.encoder.encode_action(node.bundles, node.player)
         mask = self.get_action_mask(node.bundles)
 
-        return encoded, mask, None # Needs NN eval
+        return encoded, action_features, mask, None
 
-    def apply_nn_evaluation(self, node: MCTSNode, policy: np.ndarray, value: float, is_root: bool = False):
-        """Called after batch NN evaluation completes."""
+    def apply_nn_evaluation(self, node: MCTSNode, policy: np.ndarray, value: float, is_root: bool = False) -> float:
         node.expanded = True
         node.priors = policy
 
@@ -100,21 +96,17 @@ class ParallelMCTS:
             prior_slice = policy[:len(node.bundles)]
             prior_slice = (1.0 - self.config.dirichlet_epsilon) * prior_slice + self.config.dirichlet_epsilon * noise
 
-            # Normalize
             total = float(np.sum(prior_slice))
             if total > 0:
                 prior_slice /= total
             node.priors[:len(node.bundles)] = prior_slice
 
-        # Create children
         limit = self.config.root_action_limit if is_root else self.config.child_action_limit
         branch_indices = self._branch_indices(node.priors, node.bundles, limit)
 
         for action_index in branch_indices:
             child_state = node.state.clone()
             bundle = node.bundles[action_index]
-
-            # Very simplistic enemy move prediction for internal simulation
             enemy_bundles = self.action_catalog.build(child_state, 1 - node.player)
             enemy_bundle = enemy_bundles[0] if enemy_bundles else ActionBundle("hold", 0, ("noop",))
 
@@ -156,9 +148,6 @@ class ParallelMCTS:
         for node in reversed(path):
             node.visits += 1
             node.value_sum += value
-            # In alternate turns MCTS, value inversion is needed if players alternate
-            # But in AntWar both players move simultaneously.
-            # Here we evaluate strictly from "player"'s perspective.
 
     def get_action_probs(self, root: MCTSNode, temperature: float = 1.0) -> Tuple[int, np.ndarray]:
         visit_counts = np.zeros(MAX_ACTIONS, dtype=np.float32)
@@ -180,7 +169,6 @@ class ParallelMCTS:
         scaled = np.power(visit_counts, 1.0 / temperature)
         probs = scaled / np.sum(scaled)
 
-        # Sample
         threshold = self.rng.random()
         cumulative = 0.0
         action = 0
@@ -192,24 +180,24 @@ class ParallelMCTS:
 
         return action, probs
 
-
 class ReplayBuffer:
     def __init__(self, capacity: int = 10000):
         self.capacity = capacity
         self.buffer = []
         self.position = 0
 
-    def push(self, state: np.ndarray, mask: np.ndarray, policy: np.ndarray, value: float):
+    def push(self, state: np.ndarray, action_feat: np.ndarray, mask: np.ndarray, policy: np.ndarray, value: float):
         if len(self.buffer) < self.capacity:
             self.buffer.append(None)
-        self.buffer[self.position] = (state, mask, policy, value)
+        self.buffer[self.position] = (state, action_feat, mask, policy, value)
         self.position = (self.position + 1) % self.capacity
 
-    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         batch = random.sample(self.buffer, batch_size)
-        states, masks, policies, values = zip(*batch)
+        states, action_feats, masks, policies, values = zip(*batch)
         return (
             np.stack(states),
+            np.stack(action_feats),
             np.stack(masks),
             np.stack(policies),
             np.array(values, dtype=np.float32)

@@ -92,3 +92,64 @@ class StateEncoder:
         tensor[11, :, :] = (coins_norm + round_norm) / 2.0
 
         return tensor
+
+    def encode_action(self, bundles: list, player: int) -> np.ndarray:
+        """
+        Creates a dynamic embedding representation for 96 action bundles.
+        Shape: (96, 8)
+        Feature map per bundle:
+        0: Has Build Operation
+        1: Has Upgrade Operation
+        2: Has Sell Operation
+        3: Has Base Operation
+        4: Has Weapon Operation
+        5: Normalized target X (if applicable, else 0)
+        6: Normalized target Y (if applicable, else 0)
+        7: Heuristic Score (Normalized roughly)
+        """
+        feats = np.zeros((96, 8), dtype=np.float32)
+        from SDK.utils.constants import OperationType
+
+        for i, bundle in enumerate(bundles):
+            if i >= 96:
+                break
+
+            has_build = 0.0
+            has_upgrade = 0.0
+            has_sell = 0.0
+            has_base = 0.0
+            has_weapon = 0.0
+            target_x = 0.0
+            target_y = 0.0
+
+            for op in bundle.operations:
+                op_type = op.op_type
+                if op_type == OperationType.BUILD_TOWER:
+                    has_build = 1.0
+                    target_x = op.arg0 / 19.0
+                    target_y = op.arg1 / 19.0
+                elif op_type == OperationType.UPGRADE_TOWER:
+                    has_upgrade = 1.0
+                elif op_type == OperationType.DOWNGRADE_TOWER:
+                    has_sell = 1.0
+                elif op_type in (OperationType.UPGRADE_GENERATION_SPEED, OperationType.UPGRADE_GENERATED_ANT):
+                    has_base = 1.0
+                    # Assign base to its physical location on the grid
+                    fb_x, fb_y = PLAYER_BASES[player]
+                    target_x = fb_x / 19.0
+                    target_y = fb_y / 19.0
+                elif op_type in (OperationType.USE_LIGHTNING_STORM, OperationType.USE_EMP_BLASTER, OperationType.USE_DEFLECTOR, OperationType.USE_EMERGENCY_EVASION):
+                    has_weapon = 1.0
+                    target_x = op.arg0 / 19.0
+                    target_y = op.arg1 / 19.0
+
+            feats[i, 0] = has_build
+            feats[i, 1] = has_upgrade
+            feats[i, 2] = has_sell
+            feats[i, 3] = has_base
+            feats[i, 4] = has_weapon
+            feats[i, 5] = target_x
+            feats[i, 6] = target_y
+            feats[i, 7] = min(bundle.score / 50.0, 1.0)
+
+        return feats
