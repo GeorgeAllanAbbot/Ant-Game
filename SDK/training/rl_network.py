@@ -13,9 +13,7 @@ class SEBlock(nn.Module):
 
     def forward(self, x):
         b, c, _, _ = x.size()
-        # Squeeze
         y = F.adaptive_avg_pool2d(x, 1).view(b, c)
-        # Excitation
         y = F.relu(self.fc1(y))
         y = torch.sigmoid(self.fc2(y)).view(b, c, 1, 1)
         return x * y
@@ -38,11 +36,11 @@ class ResidualBlockSE(nn.Module):
         return F.relu(out)
 
 class PolicyValueNet(nn.Module):
-    def __init__(self, in_channels: int = 12, action_feat_dim: int = 8, num_actions: int = 96, num_channels: int = 128, num_blocks: int = 6):
+    def __init__(self, in_channels: int = 28, stats_dim: int = 36, action_feat_dim: int = 10, num_actions: int = 96, num_channels: int = 128, num_blocks: int = 6):
         super().__init__()
         self.num_actions = num_actions
 
-        # Initial Conv
+        # Initial Conv (accepts 28 channels from the official environment)
         self.conv_in = nn.Conv2d(in_channels, num_channels, kernel_size=3, padding=1, bias=False)
         self.bn_in = nn.BatchNorm2d(num_channels)
 
@@ -52,12 +50,11 @@ class PolicyValueNet(nn.Module):
         ])
 
         # Global State Feature Extractor for Policy
-        # Compress spatial dimensions to a global context vector
         self.policy_conv = nn.Conv2d(num_channels, 32, kernel_size=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(32)
 
-        # Query projection for State
-        self.state_query = nn.Linear(32, 64)
+        # Query projection for State (Combines Spatial GAP + 1D Stats)
+        self.state_query = nn.Linear(32 + stats_dim, 64)
 
         # Key projection for Actions
         # Actions are represented dynamically: (Batch, NumActions, action_feat_dim)
@@ -70,26 +67,35 @@ class PolicyValueNet(nn.Module):
         # Value Head
         self.value_conv = nn.Conv2d(num_channels, 1, kernel_size=1, bias=False)
         self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(1, 64)
+        # Combines Spatial GAP (1 channel) + 1D Stats
+        self.value_fc1 = nn.Linear(1 + stats_dim, 64)
         self.value_fc2 = nn.Linear(64, 1)
 
-    def forward(self, state_x, action_features, mask=None):
+    def forward(self, board, stats, action_features, mask=None):
         """
-        state_x: (Batch, 12, 20, 20)
-        action_features: (Batch, 96, action_feat_dim) -> e.g. location, type one-hot, score
+        board: (Batch, 28, 19, 19)
+        stats: (Batch, 36)
+        action_features: (Batch, 96, action_feat_dim) -> e.g. location, type one-hot, score, combo
         mask: (Batch, 96)
         """
-        out = F.relu(self.bn_in(self.conv_in(state_x)))
+        # Zero-pad the board from 19x19 to 20x20
+        # padding format is (left, right, top, bottom)
+        board = F.pad(board, (0, 1, 0, 1))
+
+        out = F.relu(self.bn_in(self.conv_in(board)))
         for block in self.res_blocks:
             out = block(out)
 
         # --- Policy Head (Attention-based dynamic action selection) ---
         p = F.relu(self.policy_bn(self.policy_conv(out)))
-        # Global Average Pooling to retain spatial summarization without full flattening
+        # Global Average Pooling
         p = F.adaptive_avg_pool2d(p, 1).view(p.size(0), -1) # (Batch, 32)
 
+        # Concatenate 1D stats to spatial features
+        p_combined = torch.cat([p, stats], dim=1) # (Batch, 32 + stats_dim)
+
         # Project state to Query: (Batch, 64) -> (Batch, 1, 64)
-        q = self.state_query(p).unsqueeze(1)
+        q = self.state_query(p_combined).unsqueeze(1)
 
         # Project dynamic actions to Keys: (Batch, NumActions, 64)
         k = self.action_key(action_features)
@@ -97,8 +103,8 @@ class PolicyValueNet(nn.Module):
         # Dot product for logits: (Batch, 1, 64) @ (Batch, 64, NumActions) -> (Batch, 1, NumActions)
         logits = torch.bmm(q, k.transpose(1, 2)).squeeze(1) # (Batch, NumActions)
 
-        # Scale down logits to prevent softmax saturation
-        logits = logits / np.sqrt(64)
+        # Scale down logits
+        logits = logits / np.sqrt(64.0)
 
         if mask is not None:
             # Mask invalid actions
@@ -109,8 +115,12 @@ class PolicyValueNet(nn.Module):
         # --- Value Head ---
         v = F.relu(self.value_bn(self.value_conv(out)))
         v = F.adaptive_avg_pool2d(v, 1).view(v.size(0), -1) # (Batch, 1)
-        v = F.relu(self.value_fc1(v))
-        value = torch.tanh(self.value_fc2(v))
+
+        # Concatenate 1D stats
+        v_combined = torch.cat([v, stats], dim=1) # (Batch, 1 + stats_dim)
+
+        v_out = F.relu(self.value_fc1(v_combined))
+        value = torch.tanh(self.value_fc2(v_out))
 
         return policy, value
 
