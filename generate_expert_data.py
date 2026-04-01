@@ -158,4 +158,4 @@ def collect_expert_data(num_games=3000, save_path="data/expert_data.npz"):
     print(f"💾 数据已保存至 {save_path}")
 
 if __name__ == "__main__":
-    collect_expert_data(num_games=2)
+    collect_expert_data(num_games=5000)

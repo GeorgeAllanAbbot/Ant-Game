@@ -43,7 +43,7 @@ def train_supervised(data_path="data/expert_data.npz", save_model_path="checkpoi
     model = PolicyValueNet().to(device) 
     
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    epochs = 10 
+    epochs = 25
     
     model.train()
     for epoch in range(epochs):
