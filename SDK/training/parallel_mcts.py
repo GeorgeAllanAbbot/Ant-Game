@@ -1,0 +1,219 @@
+import math
+import random
+import numpy as np
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Dict, Any
+
+from SDK.backend.state import BackendState
+from SDK.utils.actions import ActionBundle, ActionCatalog
+from SDK.training.state_encoder import StateEncoder
+from SDK.utils.constants import MAX_ACTIONS
+
+@dataclass
+class SearchConfig:
+    iterations: int = 64
+    max_depth: int = 4
+    c_puct: float = 1.25
+    root_action_limit: int = 16
+    child_action_limit: int = 10
+    dirichlet_alpha: float = 0.35
+    dirichlet_epsilon: float = 0.25
+    seed: int = 0
+
+@dataclass
+class MCTSNode:
+    state: BackendState
+    player: int
+    prior: float = 0.0
+    action_index: int = 0
+    depth: int = 0
+
+    visits: int = 0
+    value_sum: float = 0.0
+    expanded: bool = False
+
+    bundles: List[ActionBundle] = field(default_factory=list)
+    priors: Optional[np.ndarray] = None
+    children: List['MCTSNode'] = field(default_factory=list)
+
+    @property
+    def mean_value(self) -> float:
+        if self.visits == 0:
+            return 0.0
+        return self.value_sum / self.visits
+
+
+class ParallelMCTS:
+    def __init__(self, config: SearchConfig):
+        self.config = config
+        self.action_catalog = ActionCatalog(max_actions=MAX_ACTIONS)
+        self.encoder = StateEncoder()
+        self.rng = random.Random(config.seed)
+
+    def get_action_mask(self, bundles: List[ActionBundle]) -> np.ndarray:
+        return self.action_catalog.action_mask(bundles).astype(np.float32)
+
+    def select(self, node: MCTSNode) -> List[MCTSNode]:
+        """Traverse tree to find a leaf node"""
+        path = [node]
+        current = node
+        while current.expanded and current.children and current.depth < self.config.max_depth and not current.state.terminal:
+            best_child = max(current.children, key=lambda c: self.puct_score(current, c))
+            path.append(best_child)
+            current = best_child
+        return path
+
+    def puct_score(self, parent: MCTSNode, child: MCTSNode) -> float:
+        explore = self.config.c_puct * child.prior * math.sqrt(parent.visits + 1.0) / (child.visits + 1.0)
+        return child.mean_value + explore
+
+    def expand_and_evaluate_request(self, node: MCTSNode) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        Returns (encoded_state, action_mask, heuristic_value) for the NN batch.
+        If node is terminal, returns a value immediately without NN inference.
+        """
+        terminal = self._terminal_value(node.state, node.player)
+        if terminal is not None:
+            node.expanded = True
+            return None, None, terminal
+
+        node.bundles = self.action_catalog.build(node.state, node.player)
+        if not node.bundles or node.depth >= self.config.max_depth:
+            node.expanded = True
+            # For simplicity, fallback heuristic or 0
+            return None, None, 0.0
+
+        encoded = self.encoder.encode(node.state, node.player)
+        mask = self.get_action_mask(node.bundles)
+
+        return encoded, mask, None # Needs NN eval
+
+    def apply_nn_evaluation(self, node: MCTSNode, policy: np.ndarray, value: float, is_root: bool = False):
+        """Called after batch NN evaluation completes."""
+        node.expanded = True
+        node.priors = policy
+
+        if is_root and len(node.bundles) > 1 and self.config.dirichlet_epsilon > 0.0:
+            noise = np.random.default_rng(self.rng.randrange(1 << 30)).dirichlet(
+                [self.config.dirichlet_alpha] * len(node.bundles)
+            ).astype(np.float32)
+            prior_slice = policy[:len(node.bundles)]
+            prior_slice = (1.0 - self.config.dirichlet_epsilon) * prior_slice + self.config.dirichlet_epsilon * noise
+
+            # Normalize
+            total = float(np.sum(prior_slice))
+            if total > 0:
+                prior_slice /= total
+            node.priors[:len(node.bundles)] = prior_slice
+
+        # Create children
+        limit = self.config.root_action_limit if is_root else self.config.child_action_limit
+        branch_indices = self._branch_indices(node.priors, node.bundles, limit)
+
+        for action_index in branch_indices:
+            child_state = node.state.clone()
+            bundle = node.bundles[action_index]
+
+            # Very simplistic enemy move prediction for internal simulation
+            enemy_bundles = self.action_catalog.build(child_state, 1 - node.player)
+            enemy_bundle = enemy_bundles[0] if enemy_bundles else ActionBundle("hold", 0, ("noop",))
+
+            if node.player == 0:
+                child_state.resolve_turn(bundle.operations, enemy_bundle.operations)
+            else:
+                child_state.resolve_turn(enemy_bundle.operations, bundle.operations)
+
+            node.children.append(
+                MCTSNode(
+                    state=child_state,
+                    player=node.player,
+                    prior=float(node.priors[action_index]),
+                    action_index=action_index,
+                    depth=node.depth + 1
+                )
+            )
+
+        return value
+
+    def _branch_indices(self, priors: np.ndarray, bundles: List[ActionBundle], limit: int) -> List[int]:
+        if not bundles:
+            return []
+        branch_limit = min(limit, len(bundles))
+        order = list(np.argsort(priors[: len(bundles)])[::-1])
+        selected = order[:branch_limit]
+        if 0 not in selected:
+            selected.append(0)
+        return sorted(set(int(index) for index in selected))
+
+    def _terminal_value(self, state: BackendState, player: int) -> Optional[float]:
+        if not state.terminal:
+            return None
+        if state.winner is None:
+            return 0.0
+        return 1.0 if state.winner == player else -1.0
+
+    def backpropagate(self, path: List[MCTSNode], value: float):
+        for node in reversed(path):
+            node.visits += 1
+            node.value_sum += value
+            # In alternate turns MCTS, value inversion is needed if players alternate
+            # But in AntWar both players move simultaneously.
+            # Here we evaluate strictly from "player"'s perspective.
+
+    def get_action_probs(self, root: MCTSNode, temperature: float = 1.0) -> Tuple[int, np.ndarray]:
+        visit_counts = np.zeros(MAX_ACTIONS, dtype=np.float32)
+        for child in root.children:
+            visit_counts[child.action_index] = float(child.visits)
+
+        if np.sum(visit_counts) == 0:
+            if root.priors is not None:
+                visit_counts = root.priors
+            else:
+                visit_counts[0] = 1.0
+
+        if temperature < 1e-3:
+            action = int(np.argmax(visit_counts[:len(root.bundles)]))
+            probs = np.zeros_like(visit_counts)
+            probs[action] = 1.0
+            return action, probs
+
+        scaled = np.power(visit_counts, 1.0 / temperature)
+        probs = scaled / np.sum(scaled)
+
+        # Sample
+        threshold = self.rng.random()
+        cumulative = 0.0
+        action = 0
+        for i, p in enumerate(probs):
+            cumulative += p
+            if threshold <= cumulative:
+                action = i
+                break
+
+        return action, probs
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int = 10000):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, state: np.ndarray, mask: np.ndarray, policy: np.ndarray, value: float):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, mask, policy, value)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        batch = random.sample(self.buffer, batch_size)
+        states, masks, policies, values = zip(*batch)
+        return (
+            np.stack(states),
+            np.stack(masks),
+            np.stack(policies),
+            np.array(values, dtype=np.float32)
+        )
+
+    def __len__(self):
+        return len(self.buffer)
