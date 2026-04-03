@@ -45,3 +45,5 @@ game_debugged
 game_repro_replay.json
 mini_replay.txt
 update.md
+*.pt
+*.npz

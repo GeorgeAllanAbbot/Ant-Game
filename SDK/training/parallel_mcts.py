@@ -171,8 +171,20 @@ class ParallelMCTS:
             probs[action] = 1.0
             return action, probs
 
-        scaled = np.power(visit_counts, 1.0 / temperature)
-        probs = scaled / np.sum(scaled)
+        # 当温度极小（贪心模式）时，直接使用 Argmax 防止数值溢出
+        if temperature < 1e-2:
+            best_action_idx = np.argmax(visit_counts)
+            probs = np.zeros_like(visit_counts, dtype=np.float32)
+            probs[best_action_idx] = 1.0
+        else:
+            # 正常温度（探索模式）为了绝对安全，加入微小偏置并归一化
+            # 避免全 0 访问量时除以 0
+            scaled = np.power(visit_counts, 1.0 / temperature)
+            sum_scaled = np.sum(scaled)
+            if sum_scaled > 0:
+                probs = scaled / sum_scaled
+            else:
+                probs = np.ones_like(visit_counts, dtype=np.float32) / len(visit_counts)
 
         threshold = self.rng.random()
         cumulative = 0.0

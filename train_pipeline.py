@@ -4,10 +4,10 @@ import math
 import random
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.multiprocessing as mp
 from queue import Empty
-from collections import deque
-from dataclasses import asdict
 
 from SDK.backend import create_python_backend_state
 from SDK.training.env import AntWarParallelEnv
@@ -17,6 +17,7 @@ from SDK.utils.constants import MAX_ACTIONS
 
 def mcts_worker(worker_id, request_queue, response_queue):
     config = SearchConfig(seed=worker_id * 1000)
+    config.iterations = 64  # 🌟 恢复标准深度，AI 开始展现真正实力
     mcts = ParallelMCTS(config)
     env = AntWarParallelEnv(seed=config.seed, max_actions=MAX_ACTIONS)
 
@@ -25,6 +26,9 @@ def mcts_worker(worker_id, request_queue, response_queue):
         trajectory = []
 
         for round_idx in range(512):
+            if round_idx % 50 == 0:
+                print(f"[Worker {worker_id}] Searching Step {round_idx}/512 ...")
+
             if not env.agents:
                 break
 
@@ -32,11 +36,7 @@ def mcts_worker(worker_id, request_queue, response_queue):
 
             for _ in range(config.iterations):
                 paths = {}
-                batch_boards = []
-                batch_stats = []
-                batch_action_features = []
-                batch_masks = []
-                batch_agents = []
+                batch_boards, batch_stats, batch_action_features, batch_masks, batch_agents = [], [], [], [], []
 
                 for agent in env.possible_agents:
                     root = roots[agent]
@@ -56,12 +56,7 @@ def mcts_worker(worker_id, request_queue, response_queue):
                             mcts.backpropagate(path, heuristic)
 
                 if batch_boards:
-                    board_np = np.stack(batch_boards)
-                    stats_np = np.stack(batch_stats)
-                    action_feat_np = np.stack(batch_action_features)
-                    mask_np = np.stack(batch_masks)
-                    request_queue.put(('eval', worker_id, board_np, stats_np, action_feat_np, mask_np))
-
+                    request_queue.put(('eval', worker_id, np.stack(batch_boards), np.stack(batch_stats), np.stack(batch_action_features), np.stack(batch_masks)))
                     policies, values = response_queue.get()
 
                     for i, agent in enumerate(batch_agents):
@@ -99,19 +94,23 @@ def mcts_worker(worker_id, request_queue, response_queue):
         request_queue.put(('trajectory', final_data))
 
 def evaluator_worker(model_path, best_model_path, result_queue):
-    device = torch.device('cpu')
-    current_model = PolicyValueNet.load_checkpoint(model_path, device=device)
+    device = torch.device('cpu') 
+    current_model = PolicyValueNet().to(device)
+    best_model = PolicyValueNet().to(device)
+    
+    current_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    best_model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
     current_model.eval()
-    best_model = PolicyValueNet.load_checkpoint(best_model_path, device=device)
     best_model.eval()
 
     config = SearchConfig()
+    config.iterations = 64 # 🌟 裁判也恢复最高智商
     mcts_current = ParallelMCTS(config)
     mcts_best = ParallelMCTS(config)
 
     wins = 0
     draws = 0
-    num_games = 20
+    num_games = 20 # 🌟 恢复 20 局严谨评测
 
     for game in range(num_games):
         env = AntWarParallelEnv(seed=game, max_actions=MAX_ACTIONS)
@@ -134,20 +133,18 @@ def evaluator_worker(model_path, best_model_path, result_queue):
 
                 mask = mcts.get_action_mask(bundles)
                 obs = mcts.feature_extractor.encode_observation(env.state, i, mask)
-                board = obs['board']
-                stats = obs['stats']
-                action_feat = mcts.action_encoder.encode_action(bundles, i)
 
                 with torch.no_grad():
-                    b = torch.tensor(board, dtype=torch.float32, device=device).unsqueeze(0)
-                    s = torch.tensor(stats, dtype=torch.float32, device=device).unsqueeze(0)
-                    a = torch.tensor(action_feat, dtype=torch.float32, device=device).unsqueeze(0)
+                    b = torch.tensor(obs['board'], dtype=torch.float32, device=device).unsqueeze(0)
+                    s = torch.tensor(obs['stats'], dtype=torch.float32, device=device).unsqueeze(0)
+                    a = torch.tensor(mcts.action_encoder.encode_action(bundles, i), dtype=torch.float32, device=device).unsqueeze(0)
                     m = torch.tensor(mask, dtype=torch.float32, device=device).unsqueeze(0)
-                    policy, _ = model(b, s, a, m)
-                    policy = policy[0].numpy()
+                    
+                    policy_logits, _ = model(b, s, a, m)
+                    policy_logits[~m.bool()] = -1e9
+                    policy = F.softmax(policy_logits, dim=1)[0].numpy()
 
-                action = int(np.argmax(policy[:len(bundles)]))
-                actions[agent] = action
+                actions[agent] = int(np.argmax(policy[:len(bundles)]))
 
             env.step(actions)
 
@@ -159,23 +156,46 @@ def evaluator_worker(model_path, best_model_path, result_queue):
     win_rate = wins / num_games
     result_queue.put(win_rate)
 
+def safe_save_model(model, path):
+    state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+    torch.save(state_dict, path)
+
 def train_pipeline():
     mp.set_start_method('spawn', force=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f"🚀 [PRODUCTION] Initializing Deep Learning Cluster...")
 
     os.makedirs('checkpoints', exist_ok=True)
     model = PolicyValueNet()
-    model.to(device)
-    model.share_memory()
 
-    model.save_checkpoint('checkpoints/best_model.pt')
-    model.save_checkpoint('checkpoints/latest_model.pt')
+    gpu_count = torch.cuda.device_count()
+    if gpu_count > 1:
+        model = nn.DataParallel(model)
+    model.to(device)
+
+    pretrained_path = 'checkpoints/sl_pretrained.pth'
+    if os.path.exists(pretrained_path):
+        try:
+            checkpoint = torch.load(pretrained_path, map_location=device, weights_only=False)
+            state_dict = checkpoint.get("model_state_dict", checkpoint.get("state_dict", checkpoint))
+            clean_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            
+            if isinstance(model, nn.DataParallel):
+                model.module.load_state_dict(clean_dict)
+            else:
+                model.load_state_dict(clean_dict)
+        except Exception as e:
+            pass
+
+    safe_save_model(model, 'checkpoints/best_model.pt')
+    safe_save_model(model, 'checkpoints/latest_model.pt')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    buffer = ReplayBuffer(capacity=50000)
+    buffer = ReplayBuffer(capacity=100000)
 
-    num_workers = min(4, os.cpu_count() or 1)
+    num_workers = 16 # 🌟 满血 16 核心启动
+    print(f"⚔️ Spawning {num_workers} MCTS CPU Workers...")
+    
     request_queue = mp.Queue()
     response_queues = [mp.Queue() for _ in range(num_workers)]
     eval_result_queue = mp.Queue()
@@ -195,13 +215,15 @@ def train_pipeline():
 
     try:
         while True:
-            while not request_queue.empty() and len(batch_boards) < 32:
+            # 🌟 恢复 32 的等待队列，完美匹配双卡胃口
+            while len(batch_boards) < 32:
                 try:
-                    msg = request_queue.get_nowait()
+                    msg = request_queue.get(timeout=0.05)
                     if msg[0] == 'trajectory':
                         trajectories_collected += 1
                         for data in msg[1]:
                             buffer.push(*data)
+                        print(f"🏁 [Match Finished] Game {trajectories_collected}. Buffer: {len(buffer)}/100000")
                     elif msg[0] == 'eval':
                         _, worker_id, board_np, stats_np, action_feat_np, mask_np = msg
                         for b, s, a, m in zip(board_np, stats_np, action_feat_np, mask_np):
@@ -219,8 +241,13 @@ def train_pipeline():
                     st = torch.tensor(np.stack(batch_stats), dtype=torch.float32, device=device)
                     a = torch.tensor(np.stack(batch_action_feats), dtype=torch.float32, device=device)
                     m = torch.tensor(np.stack(batch_masks), dtype=torch.float32, device=device)
-                    policies, values = model(b, st, a, m)
-                    policies = policies.cpu().numpy()
+                    
+                    policies_logits, values = model(b, st, a, m)
+                    
+                    policies_logits[~m.bool()] = -1e9
+                    policies_probs = F.softmax(policies_logits, dim=1)
+                    
+                    policies = policies_probs.cpu().numpy()
                     values = values.cpu().numpy()
 
                 responses = {w_id: ([], []) for w_id in set(batch_worker_ids)}
@@ -232,31 +259,28 @@ def train_pipeline():
                 for worker_id, (p_list, v_list) in responses.items():
                     response_queues[worker_id].put((np.stack(p_list), np.stack(v_list)))
 
-                batch_boards.clear()
-                batch_stats.clear()
-                batch_action_feats.clear()
-                batch_masks.clear()
-                batch_worker_ids.clear()
+                batch_boards.clear(); batch_stats.clear(); batch_action_feats.clear(); batch_masks.clear(); batch_worker_ids.clear()
 
-            if len(buffer) >= 2048 and (trajectories_collected - last_trajectories_trained) > 0:
+            # 🌟 恢复工业级门槛：大于 1024 才开火，每次抽 512
+            if len(buffer) >= 1024 and (trajectories_collected - last_trajectories_trained) > 0:
                 updates = trajectories_collected - last_trajectories_trained
                 last_trajectories_trained = trajectories_collected
 
                 for _ in range(updates):
-                    boards, stats, action_feats, masks, policies, values = buffer.sample(256)
+                    boards, stats, action_feats, masks, policies_target, values_target = buffer.sample(512)
 
                     b = torch.tensor(boards, dtype=torch.float32, device=device)
                     st = torch.tensor(stats, dtype=torch.float32, device=device)
                     a = torch.tensor(action_feats, dtype=torch.float32, device=device)
                     m = torch.tensor(masks, dtype=torch.float32, device=device)
-                    p_target = torch.tensor(policies, dtype=torch.float32, device=device)
-                    v_target = torch.tensor(values, dtype=torch.float32, device=device).unsqueeze(1)
+                    p_target = torch.tensor(policies_target, dtype=torch.float32, device=device)
+                    v_target = torch.tensor(values_target, dtype=torch.float32, device=device).unsqueeze(1)
 
                     optimizer.zero_grad()
-                    p_pred, v_pred = model(b, st, a, m)
+                    p_pred_logits, v_pred = model(b, st, a, m)
 
-                    v_loss = torch.nn.functional.mse_loss(v_pred, v_target)
-                    p_loss = -(p_target * torch.log(p_pred + 1e-8)).sum(dim=1).mean()
+                    v_loss = F.mse_loss(v_pred, v_target)
+                    p_loss = -(p_target * F.log_softmax(p_pred_logits, dim=1)).sum(dim=1).mean()
                     loss = v_loss + p_loss
 
                     loss.backward()
@@ -264,28 +288,30 @@ def train_pipeline():
 
                     step += 1
 
-                    if step % 100 == 0:
-                        print(f"Step {step}, Value Loss: {v_loss.item():.4f}, Policy Loss: {p_loss.item():.4f}, Buffer: {len(buffer)}")
+                    if step % 20 == 0:
+                        print(f"🔥 [Cluster Train] Step {step} | Value Loss: {v_loss.item():.4f} | Policy Loss: {p_loss.item():.4f}")
 
+                    # 🌟 稳健评测：每 1000 步选拔一次新王
                     if step % 1000 == 0:
-                        model.save_checkpoint('checkpoints/latest_model.pt')
+                        safe_save_model(model, 'checkpoints/latest_model.pt')
                         if eval_process is None or not eval_process.is_alive():
-                            print("Starting evaluation...")
+                            print("⚔️ Dispatching Evaluation Process...")
                             eval_process = mp.Process(
                                 target=evaluator_worker,
                                 args=('checkpoints/latest_model.pt', 'checkpoints/best_model.pt', eval_result_queue)
                             )
                             eval_process.start()
 
+            # 4. Handle Evaluation Results
             if not eval_result_queue.empty():
                 win_rate = eval_result_queue.get()
-                print(f"Evaluation finished! Win rate: {win_rate * 100:.2f}%")
+                print(f"🏆 Evaluation finished! Challenger Win Rate: {win_rate * 100:.2f}%")
                 if win_rate > 0.55:
-                    print("New best model! Updating checkpoints/best_model.pt")
+                    print("👑 A NEW KING IS BORN! Updating checkpoints/best_model.pt")
                     os.system("cp checkpoints/latest_model.pt checkpoints/best_model.pt")
 
     except KeyboardInterrupt:
-        print("Stopping training...")
+        print("\n🛑 SHUTTING DOWN CLUSTER GRACEFULLY...")
     finally:
         for w in workers:
             w.terminate()
